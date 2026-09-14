@@ -1,0 +1,38 @@
+# Downstream-only, not synced from upstream
+FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+  CARGO_HOME=/usr/local/cargo \
+  PATH=/usr/local/cargo/bin:$PATH
+
+# curl-minimal ships by default on ubi; the full curl package conflicts with it.
+RUN dnf install -y gcc clang llvm elfutils-libelf-devel pkgconf-pkg-config \
+  ca-certificates zstd && \
+  dnf clean all
+
+# bpf-linker bundles its own matching LLVM; cargo install is discouraged
+# upstream over LLVM version-matching, so fetch the prebuilt release binary.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+  sh -s -- -y --default-toolchain stable --profile minimal && \
+  rustup component add rust-src --toolchain stable && \
+  curl -L "https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-$(uname -m)-unknown-linux-musl.tar.zst" \
+  | tar --zstd -xf - -C /usr/local/cargo/bin/
+
+WORKDIR /build
+COPY . .
+
+RUN cargo xtask build-ebpf --profile release && \
+  cargo build --release -p tls-probe
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+RUN microdnf install -y elfutils-libelf ca-certificates && \
+  microdnf clean all
+
+COPY --from=builder /build/target/release/tls-probe /usr/local/bin/tls-probe
+COPY --from=builder /build/target/bpfel-unknown-none/release/tls-probe-ebpf /usr/local/lib/tls-probe-ebpf
+
+VOLUME /data
+
+ENTRYPOINT ["tls-probe"]
+CMD ["capture", "--ebpf", "/usr/local/lib/tls-probe-ebpf", "--interface", "all", "--output", "/data/capture.json"]
